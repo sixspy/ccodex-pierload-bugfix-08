@@ -33,7 +33,10 @@ PRODUCT_META = {
 
 def connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    # 短 busy_timeout（0.25s）：正常写事务毫秒级完成不触发；写口争用时
+    # 快速冒泡 OperationalError("database is locked")，由 locks.try_acquire
+    # 的轮询层（30s 预算）显式识别并发争用，而非在 C 层静默长等。
+    conn = sqlite3.connect(DB_PATH, timeout=0.25)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn

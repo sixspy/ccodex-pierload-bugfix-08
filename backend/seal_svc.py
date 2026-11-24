@@ -14,12 +14,34 @@ from validators import format_manifest, validate_ticket_sealable
 router = APIRouter(tags=["seal"])
 
 
+def latest_seal(conn, ticket_id: int):
+    """票的最新闸代快照；无快照返回 None。齐套判定只认真实 gate_seals 行。"""
+    return conn.execute(
+        """SELECT * FROM gate_seals WHERE ticket_id=?
+           ORDER BY ticket_generation DESC, id DESC LIMIT 1""",
+        (ticket_id,),
+    ).fetchone()
+
+
+def ticket_snapshot_complete(conn, ticket) -> bool:
+    """甲路径齐套口径：存在与票当前闸代同代的最新快照。
+
+    放行行（gate_releases）永远不等于快照，禁止以放行影子意图冒充齐套。
+    """
+    seal = latest_seal(conn, ticket["id"])
+    if seal is None:
+        return False
+    return int(seal["ticket_generation"]) == int(ticket["generation"])
+
+
 @router.get("/api/seals")
 def list_seals(authorization: AuthHeader = None):
     require_user(authorization)
     with connect() as conn:
         rows = conn.execute(
-            """SELECT s.*, t.ticket_code, t.vehicle_plate FROM gate_seals s
+            """SELECT s.*, t.ticket_code, t.vehicle_plate, t.generation AS ticket_generation_now,
+                      (s.ticket_generation = t.generation) AS is_latest
+               FROM gate_seals s
                JOIN weigh_tickets t ON t.id=s.ticket_id ORDER BY s.id DESC"""
         ).fetchall()
         return {"items": [dict(r) for r in rows]}

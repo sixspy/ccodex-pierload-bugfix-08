@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
+from seal_svc import latest_seal, ticket_snapshot_complete
 from validators import validate_bl_match
 
 router = APIRouter(tags=["reconcile"])
@@ -43,7 +44,7 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
         "SELECT * FROM bl_manifests WHERE bl_code=?", (bl_code,)
     ).fetchone()
     tickets = conn.execute(
-        """SELECT ticket_code, gross_t, status, generation FROM weigh_tickets
+        """SELECT id, ticket_code, gross_t, status, generation FROM weigh_tickets
            WHERE bl_ref=? AND status NOT IN ('作废')""",
         (bl_code,),
     ).fetchall()
@@ -65,15 +66,29 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
            WHERE t.bl_ref=?""",
         (bl_code,),
     ).fetchall()
-    proof_ok = matched and len(seal_rows) >= 1
+    ticket_items = []
+    proof_blockers = []
+    for t in tickets:
+        item = dict(t)
+        complete = ticket_snapshot_complete(conn, item)
+        seal = latest_seal(conn, t["id"])
+        item["snapshot_complete"] = complete
+        item["seal_generation"] = seal["ticket_generation"] if seal else None
+        ticket_items.append(item)
+        if not complete:
+            proof_blockers.append(t["ticket_code"])
+    # 齐套口径：账实平衡且每票都有与当前闸代同代的快照；放行行不计快照。
+    proof_ok = matched and not proof_blockers
     return {
         "bl_code": bl_code,
         "declared_gross_t": declared,
         "ticket_sum_t": ticket_sum,
         "balanced": matched,
         "proof_ready": proof_ok,
+        "snapshot_kit_complete": not proof_blockers,
+        "proof_blockers": proof_blockers,
         "seal_count": len(seal_rows),
-        "tickets": [dict(t) for t in tickets],
+        "tickets": ticket_items,
         "seals": [dict(s) for s in seal_rows],
     }
 
@@ -93,7 +108,8 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             "SELECT * FROM bl_manifests WHERE bl_code=?", (ticket["bl_ref"],)
         ).fetchone()
         seal = conn.execute(
-            """SELECT * FROM gate_seals WHERE ticket_id=? ORDER BY id DESC LIMIT 1""",
+            """SELECT * FROM gate_seals WHERE ticket_id=?
+               ORDER BY ticket_generation DESC, id DESC LIMIT 1""",
             (ticket["id"],),
         ).fetchone()
         release = conn.execute(
@@ -109,17 +125,22 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             manifest_match = validate_bl_match(
                 float(bl["declared_gross_t"]), float(ticket["gross_t"])
             )
+        # 齐套只认真实同代快照；放行行（release）绝不等同快照，不再伪造闸代。
+        snapshot_complete = ticket_snapshot_complete(conn, dict(ticket))
+        coherent = bool(
+            snapshot_complete and manifest_match and overload_closed and (seal or release)
+        )
         return {
             "ticket_code": ticket_code,
             "bl_ref": ticket["bl_ref"],
             "gross_t": ticket["gross_t"],
             "manifest_matches_bl": manifest_match,
-            "has_seal": seal is not None or release is not None,
-            "seal_generation": (seal["ticket_generation"] if seal else (1 if release else None)),
+            "has_seal": seal is not None,
+            "seal_generation": seal["ticket_generation"] if seal else None,
+            "ticket_generation": ticket["generation"],
+            "snapshot_complete": snapshot_complete,
             "released": release is not None,
-            "proof_ready": True,
+            "proof_ready": coherent,
             "overload_closed": overload_closed,
-            "coherent": bool(
-                manifest_match and overload_closed and (seal or release)
-            ),
+            "coherent": coherent,
         }

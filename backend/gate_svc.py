@@ -1,4 +1,4 @@
-"""闸口放行：须无开放超重。"""
+"""闸口放行：须无开放超重，且持最新闸代快照（甲路径：无快照零增拒写）。"""
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
@@ -7,7 +7,8 @@ from auth import AuthHeader, require_user, require_writer
 from db import connect, now_iso, write_audit
 from locks import release, require_lock
 from models import GateReleaseIn
-from validators import validate_no_open_overload, validate_ticket_mutable
+from seal_svc import ticket_snapshot_complete
+from validators import validate_no_open_overload
 
 router = APIRouter(tags=["gate"])
 
@@ -40,12 +41,21 @@ def release_gate(body: GateReleaseIn, authorization: AuthHeader = None):
             ).fetchone()
             if not ticket:
                 raise HTTPException(404, "过磅票不存在")
-            validate_ticket_mutable(dict(ticket))
-            if ticket["status"] not in ("已裁定", "旁路挂起"):
-                raise HTTPException(409, "票态不允许放行")
+            if ticket["status"] == "作废":
+                raise HTTPException(409, "票态已锁定")
             if ticket["status"] == "旁路挂起":
                 raise HTTPException(409, "旁路挂起须先闭环")
+            if ticket["status"] == "已放行":
+                raise HTTPException(409, "已放行")
             validate_no_open_overload(conn, body.ticket_id)
+            # 命运条甲路径：缺最新闸代快照则正式放行零增拒写，不插任何业务行。
+            if not ticket_snapshot_complete(conn, dict(ticket)):
+                raise HTTPException(
+                    409,
+                    "缺最新闸代快照，禁止放行（零增拒写）：请先封闸写入同代快照",
+                )
+            if ticket["status"] != "已封闸":
+                raise HTTPException(409, "票态不允许放行：须先封闸生成最新闸代快照")
             exists = conn.execute(
                 "SELECT id FROM gate_releases WHERE ticket_id=? AND status='已放行'",
                 (body.ticket_id,),
@@ -78,12 +88,12 @@ def release_gate(body: GateReleaseIn, authorization: AuthHeader = None):
                 {"release_id": cur.lastrowid, "ticket_id": body.ticket_id},
             )
             conn.commit()
-            # BUGFIX-08 埋雷：放行响应冒充齐套
+            # 齐套只由真实同代快照证明，放行响应如实呈报，不再冒充 seal_ready。
             return {
                 "id": cur.lastrowid,
                 "release_ref": ref,
                 "status": "已放行",
-                "seal_ready": True,
+                "snapshot_complete": True,
             }
         finally:
             release(conn, lock_key, user)
